@@ -1,0 +1,3 @@
+# This folder stores trained models
+# Models are excluded from git due to size
+# Train your own with: python rl/alphazero_train.py
