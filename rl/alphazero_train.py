@@ -39,7 +39,7 @@ class GomokuNet(nn.Module):
         - Value: Expected outcome [-1, 1]
     """
     
-    def __init__(self, board_size=9, num_channels=128, num_res_blocks=5):
+    def __init__(self, board_size=9, num_channels=64, num_res_blocks=3):
         super().__init__()
         self.board_size = board_size
         
@@ -145,9 +145,6 @@ class MCTSNode:
     
     def ucb_score(self, parent_visits, c_puct=1.5):
         """UCB score with neural network prior."""
-        if self.visit_count == 0:
-            return float('inf')
-        
         exploitation = self.value
         exploration = c_puct * self.prior * math.sqrt(parent_visits) / (1 + self.visit_count)
         
@@ -178,7 +175,7 @@ class AlphaZeroMCTS:
         self.num_simulations = num_simulations
         self.c_puct = c_puct
     
-    def search(self, board, current_player, temperature=1.0):
+    def search(self, board, current_player, temperature=1.0, add_noise=True):
         """
         Run MCTS search and return action probabilities.
         
@@ -192,12 +189,18 @@ class AlphaZeroMCTS:
         """
         root = MCTSNode()
         
-        # Expand root with neural network
         state = self._get_state(board, current_player)
         policy, _ = self.model.predict(state, self.device)
         
         valid_actions = self._get_valid_actions(board)
         self._expand_node(root, policy, valid_actions)
+        
+        if add_noise and valid_actions:
+            noise = np.random.dirichlet([0.03] * len(valid_actions))
+            epsilon = 0.25
+            for a, n in zip(valid_actions, noise):
+                child = root.children[a]
+                child.prior = float((1 - epsilon) * child.prior + epsilon * n)
         
         # Run simulations
         for _ in range(self.num_simulations):
@@ -234,30 +237,28 @@ class AlphaZeroMCTS:
                 terminal, winner = False, None
             
             if terminal:
-                if winner == current_player:
-                    value = 1.0
-                elif winner == 3 - current_player:
-                    value = -1.0
-                else:
+                if winner == 0 or winner is None:
                     value = 0.0
+                elif winner == current_player:
+                    value = 1.0
+                else:
+                    value = -1.0
             else:
-                # Expand node
                 state = self._get_state(sim_board, sim_player)
                 policy, value = self.model.predict(state, self.device)
+                
+                if sim_player != current_player:
+                    value = -value
                 
                 valid = self._get_valid_actions(sim_board)
                 if valid:
                     self._expand_node(node, policy, valid)
-                
-                # Value from current player's perspective
-                if sim_player != current_player:
-                    value = -value
             
-            # Backpropagate
-            for i, n in enumerate(reversed(path)):
+            v = value
+            for n in reversed(path):
                 n.visit_count += 1
-                # Alternate value for each level
-                n.value_sum += value if i % 2 == 0 else -value
+                n.value_sum += v
+                v = -v
         
         # Get action probabilities from visit counts
         action_probs = np.zeros(81)
@@ -298,9 +299,17 @@ class AlphaZeroMCTS:
     
     def _expand_node(self, node, policy, valid_actions):
         """Expand node with children."""
-        for action in valid_actions:
+        if not valid_actions:
+            return
+        priors = np.array([policy[a] for a in valid_actions], dtype=np.float32)
+        s = priors.sum()
+        if s > 0:
+            priors /= s
+        else:
+            priors = np.ones(len(valid_actions), dtype=np.float32) / len(valid_actions)
+        for action, p in zip(valid_actions, priors):
             if action not in node.children:
-                node.children[action] = MCTSNode(prior=policy[action])
+                node.children[action] = MCTSNode(prior=float(p))
         node.is_expanded = True
     
     def _check_terminal(self, board, row, col):
@@ -366,6 +375,62 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+def play_against_opponent(mcts: AlphaZeroMCTS, opponent_move_fn, model_plays_first=True, temperature_threshold=15):
+    """
+    Play one game against an external opponent (e.g., heuristic AI).
+    
+    Args:
+        mcts: AlphaZero MCTS for the model
+        opponent_move_fn: Function that takes (board, player) and returns action
+        model_plays_first: If True, model is player 1, else player 2
+        temperature_threshold: Temperature threshold for exploration
+    
+    Returns:
+        List of (state, policy, result) tuples for model's moves only
+    """
+    board = np.zeros((9, 9), dtype=np.int8)
+    model_player = 1 if model_plays_first else 2
+    opponent_player = 3 - model_player
+    current_player = 1
+    game_history = []
+    move_count = 0
+    
+    while True:
+        if current_player == model_player:
+            state = np.zeros((3, 9, 9), dtype=np.float32)
+            state[0] = (board == model_player).astype(np.float32)
+            state[1] = (board == opponent_player).astype(np.float32)
+            if model_player == 1:
+                state[2] = 1.0
+            
+            temp = 1.0 if move_count < temperature_threshold else 0.1
+            action_probs = mcts.search(board, model_player, temperature=temp, add_noise=True)
+            game_history.append((state.copy(), action_probs.copy(), model_player))
+            
+            action = np.random.choice(81, p=action_probs)
+        else:
+            action = opponent_move_fn(board.copy(), opponent_player)
+        
+        row, col = action // 9, action % 9
+        board[row, col] = current_player
+        move_count += 1
+        
+        winner = check_winner(board, row, col, current_player)
+        if winner is not None or move_count >= 81:
+            results = []
+            for state, policy, player in game_history:
+                if winner == 0 or winner is None:
+                    value = 0.0
+                elif winner == model_player:
+                    value = 1.0
+                else:
+                    value = -1.0
+                results.append((state, policy, value))
+            return results
+        
+        current_player = 3 - current_player
+
+
 def self_play_game(mcts: AlphaZeroMCTS, temperature_threshold=15):
     """
     Play one game of self-play.
@@ -378,33 +443,24 @@ def self_play_game(mcts: AlphaZeroMCTS, temperature_threshold=15):
     move_count = 0
     
     while True:
-        # Get state from current player's perspective
         state = np.zeros((3, 9, 9), dtype=np.float32)
         state[0] = (board == current_player).astype(np.float32)
         state[1] = (board == (3 - current_player)).astype(np.float32)
         if current_player == 1:
             state[2] = 1.0
         
-        # Use temperature for exploration early in game
         temp = 1.0 if move_count < temperature_threshold else 0.1
-        
-        # MCTS search
-        action_probs = mcts.search(board, current_player, temperature=temp)
-        
-        # Store for training
+        action_probs = mcts.search(board, current_player, temperature=temp, add_noise=True)
         game_history.append((state.copy(), action_probs.copy(), current_player))
         
-        # Select action
         action = np.random.choice(81, p=action_probs)
         row, col = action // 9, action % 9
         
         board[row, col] = current_player
         move_count += 1
         
-        # Check terminal
         winner = check_winner(board, row, col, current_player)
         if winner is not None or move_count >= 81:
-            # Assign results
             results = []
             for state, policy, player in game_history:
                 if winner == 0 or winner is None:
@@ -442,20 +498,48 @@ def check_winner(board, row, col, player):
 
 # ============== TRAINING ==============
 
-def train_network(model, replay_buffer, batch_size=256, epochs=5, lr=1e-3, device="cuda"):
+def evaluate_loss(model, replay_buffer, batch_size=256, device="cuda"):
+    """Evaluate model loss on replay buffer without training."""
+    if len(replay_buffer) < batch_size:
+        return 0.0
+    
+    model.eval()
+    actual_batch_size = min(batch_size, len(replay_buffer))
+    
+    with torch.no_grad():
+        states, policies, values = replay_buffer.sample(actual_batch_size)
+        
+        states_t = torch.FloatTensor(states).to(device)
+        policies_t = torch.FloatTensor(policies).to(device)
+        values_t = torch.FloatTensor(values).unsqueeze(1).to(device)
+        
+        pred_policies, pred_values = model(states_t)
+        
+        policy_loss = -torch.mean(torch.sum(policies_t * F.log_softmax(pred_policies, dim=1), dim=1))
+        value_loss = F.mse_loss(pred_values, values_t)
+        
+        loss = policy_loss + value_loss
+    
+    return loss.item()
+
+
+def train_network(model, replay_buffer, optimizer, batch_size=256, epochs=5, device="cuda"):
     """Train neural network on self-play data."""
     
     if len(replay_buffer) < batch_size:
         return 0.0
     
     model.train()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     
     total_loss = 0
+    total_policy_loss = 0
+    total_value_loss = 0
     num_batches = 0
     
+    actual_batch_size = min(batch_size, len(replay_buffer))
+    
     for _ in range(epochs):
-        states, policies, values = replay_buffer.sample(batch_size)
+        states, policies, values = replay_buffer.sample(actual_batch_size)
         
         states_t = torch.FloatTensor(states).to(device)
         policies_t = torch.FloatTensor(policies).to(device)
@@ -465,22 +549,27 @@ def train_network(model, replay_buffer, batch_size=256, epochs=5, lr=1e-3, devic
         
         pred_policies, pred_values = model(states_t)
         
-        # Policy loss (cross-entropy)
         policy_loss = -torch.mean(torch.sum(policies_t * F.log_softmax(pred_policies, dim=1), dim=1))
-        
-        # Value loss (MSE)
         value_loss = F.mse_loss(pred_values, values_t)
         
-        # Combined loss
         loss = policy_loss + value_loss
         
         loss.backward()
+        
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
         
         total_loss += loss.item()
+        total_policy_loss += policy_loss.item()
+        total_value_loss += value_loss.item()
         num_batches += 1
     
-    return total_loss / max(num_batches, 1)
+    avg_loss = total_loss / max(num_batches, 1)
+    avg_policy_loss = total_policy_loss / max(num_batches, 1)
+    avg_value_loss = total_value_loss / max(num_batches, 1)
+    
+    return avg_loss
 
 
 def simple_heuristic_move(board, player):
@@ -567,8 +656,7 @@ def evaluate_model(model, device="cuda", num_games=20):
         
         while True:
             if current == 1:
-                # Model plays
-                probs = mcts.search(board, 1, temperature=0.1)
+                probs = mcts.search(board, 1, temperature=0.1, add_noise=False)
                 action = np.argmax(probs)
             else:
                 # Heuristic plays
@@ -599,8 +687,11 @@ def train_alphazero(
     mcts_simulations=100,
     batch_size=256,
     train_epochs=10,
-    lr=1e-3,
-    resume=True,  # Auto-resume from checkpoint
+    lr=5e-4,
+    resume=True,
+    adaptive_simulations=True,
+    use_curriculum=True,
+    opponent_ratio=0.5,
 ):
     """
     AlphaZero training loop.
@@ -609,8 +700,9 @@ def train_alphazero(
     print(f"Using device: {device}")
     
     # Initialize
-    model = GomokuNet(num_res_blocks=5).to(device)
+    model = GomokuNet(board_size=9, num_channels=64, num_res_blocks=3).to(device)
     replay_buffer = ReplayBuffer(max_size=50000)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     
     # Try to resume from checkpoint
     start_iteration = 0
@@ -639,26 +731,92 @@ def train_alphazero(
     print(f"{'='*60}\n")
     
     best_win_rate = 0.0
+    current_simulations = mcts_simulations
     
     for iteration in range(num_iterations):
         print(f"\n--- Iteration {iteration + 1}/{num_iterations} ---")
         
-        # Self-play
-        print(f"Self-play ({games_per_iteration} games)...")
+        if adaptive_simulations:
+            if iteration < 3:
+                current_simulations = 25
+            elif iteration < 10:
+                current_simulations = 50
+            elif iteration < 20:
+                current_simulations = 100
+            else:
+                current_simulations = mcts_simulations
+            mcts.num_simulations = current_simulations
+            print(f"Using {current_simulations} MCTS simulations")
+        
+        if use_curriculum:
+            if iteration < num_iterations * 0.3:
+                opponent_games = 0
+                self_play_games = games_per_iteration
+                training_mode = "self-play (warm-up)"
+            elif iteration < num_iterations * 0.8:
+                opponent_games = int(games_per_iteration * opponent_ratio)
+                self_play_games = games_per_iteration - opponent_games
+                training_mode = "mixed (self-play + heuristic)"
+            else:
+                opponent_games = int(games_per_iteration * (opponent_ratio * 0.5))
+                self_play_games = games_per_iteration - opponent_games
+                training_mode = "self-play-heavy"
+        else:
+            opponent_games = int(games_per_iteration * opponent_ratio)
+            self_play_games = games_per_iteration - opponent_games
+            training_mode = "mixed (fixed ratio)"
+        
+        print(f"Training mode: {training_mode}")
+        print(f"  Self-play games: {self_play_games}, Opponent games: {opponent_games}")
+        
+        total_samples = 0
         for game_idx in tqdm(range(games_per_iteration)):
-            game_data = self_play_game(mcts)
+            if game_idx < opponent_games:
+                model_first = (game_idx % 2 == 0)
+                game_data = play_against_opponent(
+                    mcts, 
+                    simple_heuristic_move,
+                    model_plays_first=model_first
+                )
+            else:
+                game_data = self_play_game(mcts)
+            
             for state, policy, value in game_data:
                 replay_buffer.add(state, policy, value)
+                total_samples += 1
         
         print(f"Replay buffer size: {len(replay_buffer)}")
+        print(f"New samples this iteration: {total_samples}")
         
-        # Training
+        if len(replay_buffer) < batch_size:
+            print(f"Warning: Replay buffer ({len(replay_buffer)}) < batch_size ({batch_size})")
+            print("Skipping training this iteration...")
+            continue
+        
         print("Training neural network...")
-        for _ in range(train_epochs):
-            loss = train_network(model, replay_buffer, batch_size, epochs=1, lr=lr, device=device)
-        print(f"Loss: {loss:.4f}")
         
-        # Update MCTS with new model
+        initial_loss = evaluate_loss(model, replay_buffer, batch_size, device=device)
+        print(f"  Initial loss (before training): {initial_loss:.4f}")
+        
+        for epoch in range(train_epochs):
+            loss = train_network(model, replay_buffer, optimizer, batch_size, epochs=1, device=device)
+            if epoch == 0 or (epoch + 1) % 2 == 0:
+                print(f"  Epoch {epoch + 1}/{train_epochs}: Loss = {loss:.4f}")
+        
+        final_loss = evaluate_loss(model, replay_buffer, batch_size, device=device)
+        loss_reduction = initial_loss - final_loss
+        loss_reduction_pct = (loss_reduction / initial_loss) * 100 if initial_loss > 0 else 0
+        
+        print(f"Loss: {initial_loss:.4f} → {final_loss:.4f} (reduced by {loss_reduction:.4f}, {loss_reduction_pct:.1f}%)")
+        
+        if loss_reduction < 0.01 or loss_reduction_pct < 1.0:
+            print(" Warning: Loss reduction is very small!")
+            print("   This suggests the model is not learning effectively.")
+            print("   Consider:")
+            print("     - The model may need more training iterations")
+            print("     - Try reducing learning rate further")
+            print("     - Check if training data quality is good")
+        
         mcts.model = model
         
         # Evaluation every 5 iterations
@@ -687,10 +845,14 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--iterations", type=int, default=30)
+    parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--games", type=int, default=50)
     parser.add_argument("--simulations", type=int, default=100)
     parser.add_argument("--no-resume", action="store_true", help="Start fresh, don't load checkpoint")
+    parser.add_argument("--no-adaptive", action="store_true", help="Disable adaptive simulations")
+    parser.add_argument("--no-curriculum", action="store_true", help="Disable curriculum learning")
+    parser.add_argument("--opponent-ratio", type=float, default=0.5, help="Ratio of games vs opponent (0.0-1.0)")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     args = parser.parse_args()
     
     train_alphazero(
@@ -698,5 +860,9 @@ if __name__ == "__main__":
         games_per_iteration=args.games,
         mcts_simulations=args.simulations,
         resume=not args.no_resume,
+        adaptive_simulations=not args.no_adaptive,
+        use_curriculum=not args.no_curriculum,
+        opponent_ratio=args.opponent_ratio,
+        lr=args.lr,
     )
 

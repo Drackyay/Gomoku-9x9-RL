@@ -46,5 +46,24 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Streamlit
+# Streamlit / old GUI artifacts
 .streamlit/
+
+# Node / React frontend
+frontend/node_modules/
+frontend/build/
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+*.log
+
+# Python bytecode compiled by editors/IDEs
+*.pyc
+*.pyo
+*.pyd
+
+# Misc
+*.tmp
+*.bak
+*.orig
