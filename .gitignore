@@ -36,12 +36,10 @@ ENV/
 .ipynb_checkpoints/
 
 # Project specific
-models/*.zip
-# models/*.pth  # Allow model files to be tracked
-models/*.pkl
-models/checkpoints/
+metrics/
+models/
+quick_start/
 logs/
-!models/.gitkeep
 
 # OS
 .DS_Store

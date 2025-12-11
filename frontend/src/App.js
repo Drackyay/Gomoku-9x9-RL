@@ -2,7 +2,8 @@ import React, { useState, useEffect } from 'react';
 import './App.css';
 
 const BOARD_SIZE = 9;
-const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+// Use relative path to leverage React's proxy, or 127.0.0.1 to avoid AirPlay conflict
+const API_URL = process.env.REACT_APP_API_URL || '';
 
 function App() {
   const [board, setBoard] = useState(Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(0)));
@@ -70,7 +71,8 @@ function App() {
     setWaitingForAI(true);
 
     try {
-      const response = await fetch(`${API_URL}/api/move`, {
+      const apiEndpoint = API_URL ? `${API_URL}/api/move` : '/api/move';
+      const response = await fetch(apiEndpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

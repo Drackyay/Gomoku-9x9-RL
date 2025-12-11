@@ -1,16 +1,56 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sys
+import os
 from pathlib import Path
 import numpy as np
 
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+# Get project root directory
+# This file is in api/, so we need to go up one level
+try:
+    # When running as a script, __file__ is the path to this file
+    current_file = Path(__file__).resolve()
+    project_root = current_file.parent.parent
+except NameError:
+    # When imported as a module or in some edge cases, try working directory
+    cwd = Path.cwd().resolve()
+    if (cwd / 'rl').exists() and (cwd / 'api').exists():
+        project_root = cwd
+    elif (cwd.parent / 'rl').exists() and (cwd.parent / 'api').exists():
+        project_root = cwd.parent
+    else:
+        # Last resort: check common locations
+        project_root = Path.cwd()
+        while project_root != project_root.parent:
+            if (project_root / 'rl').exists() and (project_root / 'api').exists():
+                break
+            project_root = project_root.parent
+        else:
+            raise RuntimeError(f"Cannot find project root. Please run from project root or set PYTHONPATH.")
+
+# Add project root to Python path (must be absolute path)
+project_root = project_root.resolve()
+project_root_str = str(project_root)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
+
+# Debug: print path info (can remove later)
+import os
+if os.environ.get('DEBUG_PATHS'):
+    print(f"Project root: {project_root_str}")
+    print(f"Python path: {sys.path[:3]}")
 
 from rl.mcts_ai import mcts_move
 
 app = Flask(__name__)
-CORS(app)
+# Enable CORS for all routes and origins
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ["http://localhost:3000", "http://127.0.0.1:3000"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"]
+    }
+})
 
 BOARD_SIZE = 9
 MCTS_SIMULATIONS = 500
@@ -123,4 +163,5 @@ def health():
     })
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    # Use 127.0.0.1 explicitly to avoid IPv6/localhost issues
+    app.run(debug=True, host='127.0.0.1', port=5000)
